@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $dist = Join-Path $PSScriptRoot 'dist'
 $exe = Join-Path $dist '黑屏守护.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw '请先运行 build.ps1 并完成验证。' }

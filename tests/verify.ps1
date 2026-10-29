@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $project = Split-Path $PSScriptRoot -Parent
 $report = Join-Path $project ('.artifacts/verification/' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
 & (Join-Path $project 'build.ps1') -TestBuild

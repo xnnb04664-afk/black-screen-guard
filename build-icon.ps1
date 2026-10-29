@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 $assets = Join-Path $PSScriptRoot 'assets'
 $source = [Drawing.Image]::FromFile((Join-Path $assets 'app-icon.png'))

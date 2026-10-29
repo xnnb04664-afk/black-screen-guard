@@ -1,4 +1,4 @@
-param([string]$OutputPath, [switch]$TestBuild)
+﻿param([string]$OutputPath, [switch]$TestBuild)
 $ErrorActionPreference = 'Stop'
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
 if (-not (Test-Path -LiteralPath $compiler)) { throw '需要 Windows 的 .NET Framework 4.8。' }

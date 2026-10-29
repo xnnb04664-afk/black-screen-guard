@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $project = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $project 'dist/黑屏守护.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw '请先运行 build.ps1 编译正式版。' }

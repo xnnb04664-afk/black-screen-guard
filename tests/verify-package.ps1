@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $project = Split-Path $PSScriptRoot -Parent
 $dist = Join-Path $project 'dist'
