@@ -1,0 +1,10 @@
+# Local executables, old portable editions and verification artifacts
+/*.exe
+/*.exe.config
+/*.zip
+/dist/
+/.artifacts/
+/验证结果/
+*.dat
+*.tmp
+*.log
