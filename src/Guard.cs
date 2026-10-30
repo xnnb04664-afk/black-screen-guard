@@ -63,8 +63,11 @@ namespace BlackScreenGuard
         }
         protected override void WndProc(ref Message m)
         {
-            // Suppress screen savers and monitor-power requests on this desktop only.
-            if (m.Msg == 0x112 && ((m.WParam.ToInt64() & 0xFFF0) == 0xF140 || (m.WParam.ToInt64() & 0xFFF0) == 0xF170)) return;
+            // Allow Windows monitor-power commands, while keeping screen savers off this desktop.
+            if (m.Msg == Native.WmSysCommand && (m.WParam.ToInt64() & 0xFFF0) == 0xF140) return;
+#if TEST_BUILD
+            if (m.Msg == Native.WmSysCommand && (m.WParam.ToInt64() & 0xFFF0) == Native.MonitorPower && owner.CaptureTestPowerCommand(m.LParam.ToInt64())) return;
+#endif
             base.WndProc(ref m);
         }
     }
@@ -74,6 +77,7 @@ namespace BlackScreenGuard
         private readonly List<BlackForm> forms = new List<BlackForm>();
         private readonly Credentials credentials;
         private readonly string original;
+        private readonly bool displayOff;
 #if TEST_BUILD
         private readonly string testMode, testDirectory;
 #endif
@@ -82,8 +86,11 @@ namespace BlackScreenGuard
         private readonly KeyboardPolicy policy = new KeyboardPolicy();
         private readonly Native.HookProc callback;
         private readonly Native.HookProc mouseCallback;
+        private readonly Native.WinEventProc desktopCallback;
+        private readonly EventSignal signal;
+        private readonly RegisteredWaitHandle activeWait, stopWait;
         private readonly uint ownProcessId = (uint)Process.GetCurrentProcess().Id;
-        private IntPtr hook, mouseHook;
+        private IntPtr hook, mouseHook, desktopHook;
         private readonly System.Windows.Forms.Timer timer;
         private readonly Panel prompt;
         private readonly TextBox password;
@@ -91,7 +98,7 @@ namespace BlackScreenGuard
         private readonly Button unlock;
         private readonly Stopwatch inactivity = Stopwatch.StartNew(), retryClock = new Stopwatch();
         private bool cursorHidden, checking, closing, wasActive, desktopWasVisible, disposed;
-        private int attempts, retryDelay, displaysChanged, revealPending, pendingExit = -1;
+        private int attempts, retryDelay, displaysChanged, revealPending, desktopChanged, pendingExit = -1;
 #if TEST_BUILD
         private bool tested;
         private int blockedKeys, restoreRetries;
@@ -99,12 +106,15 @@ namespace BlackScreenGuard
         private Stopwatch testClock;
         private Process focusTarget;
         private bool focusInjected, focusChecked;
+        private bool timeoutPromptShown;
+        private readonly System.Windows.Forms.Timer testTimer;
 #endif
         internal bool PromptVisible { get { return prompt.Visible; } }
 
-        internal GuardContext(string original, string token, int parentId, string credentialPath, bool awake, string testMode, string testDirectory)
+        internal GuardContext(string original, string token, int parentId, string credentialPath, bool awake, bool displayOff, string testMode, string testDirectory)
         {
             this.original = original;
+            this.displayOff = displayOff;
 #if TEST_BUILD
             this.testMode = testMode; this.testDirectory = testDirectory;
 #endif
@@ -117,6 +127,10 @@ namespace BlackScreenGuard
             stop = EventWaitHandle.OpenExisting("Local\\BSG_" + token + "_stop");
             callback = Keyboard;
             mouseCallback = Mouse;
+            signal = new EventSignal(delegate { Tick(null, EventArgs.Empty); });
+            timer = new System.Windows.Forms.Timer();
+            timer.Tick += Tick;
+            desktopCallback = delegate { Interlocked.Exchange(ref desktopChanged, 1); signal.Signal(); };
 
             prompt = new Panel { BackColor = Color.FromArgb(18, 20, 24), Size = new Size(400, 236), Visible = false };
             var title = new Label { Text = "输入密码，回到桌面", ForeColor = Color.White, AutoSize = false,
@@ -146,14 +160,24 @@ namespace BlackScreenGuard
             if (hook == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             mouseHook = Native.SetWindowsHookEx(14, mouseCallback, Native.GetModuleHandle(null), 0);
             if (mouseHook == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            if (awake && Native.SetThreadExecutionState(Native.Continuous | Native.SystemRequired | Native.DisplayRequired) == 0)
+            if (Native.SetThreadExecutionState(Native.ExecutionFlags(awake, displayOff)) == 0)
                 throw new InvalidOperationException("无法启用防自动睡眠，已取消黑屏。");
             HideCursor();
             SystemEvents.DisplaySettingsChanged += DisplaysChanged;
-            timer = new System.Windows.Forms.Timer { Interval = 150 };
-            timer.Tick += Tick;
-            timer.Start();
+            // Event-driven in steady state. The timer only runs for prompt expiry or recovery.
+            desktopHook = Native.SetWinEventHook(0x20, 0x20, IntPtr.Zero, desktopCallback, 0, 0, 0);
+            if (desktopHook == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            activeWait = ThreadPool.RegisterWaitForSingleObject(active, delegate { signal.Signal(); }, null, Timeout.Infinite, true);
+            stopWait = ThreadPool.RegisterWaitForSingleObject(stop, delegate { signal.Signal(); }, null, Timeout.Infinite, true);
+            parent.Exited += ParentExited;
+            parent.EnableRaisingEvents = true;
+#if TEST_BUILD
+            testTimer = new System.Windows.Forms.Timer { Interval = 150 };
+            testTimer.Tick += Tick;
+            if (!String.IsNullOrEmpty(testMode)) testTimer.Start();
+#endif
             ready.Set();
+            signal.Signal();
         }
 
         private void BuildScreens()
@@ -174,11 +198,21 @@ namespace BlackScreenGuard
 
         private void DisplaysChanged(object sender, EventArgs e)
         {
-            // SystemEvents may run on another thread. The timer owns all window rebuilds.
+            // SystemEvents may run on another thread. The stable message window owns UI work.
             Interlocked.Exchange(ref displaysChanged, 1);
+            signal.Signal();
         }
 
-        internal void Touch() { inactivity.Restart(); }
+        private void ParentExited(object sender, EventArgs e) { signal.Signal(); }
+        private void Schedule(int milliseconds)
+        {
+            timer.Stop(); timer.Interval = Math.Max(1, milliseconds); timer.Start();
+        }
+        internal void Touch()
+        {
+            inactivity.Restart();
+            if (PromptVisible && pendingExit < 0) Schedule(12000);
+        }
         internal void Reveal(BlackForm form)
         {
             if (closing) return;
@@ -186,6 +220,7 @@ namespace BlackScreenGuard
             prompt.Parent = form;
             prompt.Location = new Point(Math.Max(0, (form.ClientSize.Width - prompt.Width) / 2), Math.Max(0, (form.ClientSize.Height - prompt.Height) / 2));
             prompt.Visible = true;
+            Schedule(12000);
             if (cursorHidden) { Cursor.Show(); cursorHidden = false; }
             form.Activate(); password.Focus();
         }
@@ -194,6 +229,13 @@ namespace BlackScreenGuard
         {
             if (checking) return;
             password.Clear(); error.Text = ""; prompt.Visible = false; HideCursor();
+            if (pendingExit < 0) timer.Stop();
+            if (wasActive) RequestDisplayOff();
+        }
+        private void RequestDisplayOff()
+        {
+            if (displayOff && !closing && pendingExit < 0 && !Native.PostMessage(forms[0].Handle, Native.WmSysCommand, new IntPtr(Native.MonitorPower), new IntPtr(2)))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         }
         private IntPtr Keyboard(int code, IntPtr message, IntPtr data)
         {
@@ -204,8 +246,9 @@ namespace BlackScreenGuard
                 bool up = kind == Native.WmKeyUp || kind == Native.WmSysKeyUp;
                 if (down || up)
                 {
-                    var input = (Native.KeyboardData)Marshal.PtrToStructure(data, typeof(Native.KeyboardData));
-                    if (policy.Block((int)input.Key, down))
+                    // vkCode is the first integer in KBDLLHOOKSTRUCT; avoid boxing per key event.
+                    int key = Marshal.ReadInt32(data);
+                    if (policy.Block(key, down))
                     {
 #if TEST_BUILD
                         blockedKeys++;
@@ -216,7 +259,7 @@ namespace BlackScreenGuard
                     Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out foregroundProcess);
                     if (foregroundProcess != ownProcessId)
                     {
-                        if (down) Interlocked.Exchange(ref revealPending, 1);
+                        if (down) { Interlocked.Exchange(ref revealPending, 1); signal.Signal(); }
                         return new IntPtr(1);
                     }
                     // No password hashing, UI rendering, I/O or waits inside this callback.
@@ -229,12 +272,12 @@ namespace BlackScreenGuard
             if (code >= 0 && !closing)
             {
                 // MSLLHOOKSTRUCT starts with POINT. Pass mouse input only to this process's windows.
-                var point = (Point)Marshal.PtrToStructure(data, typeof(Point));
+                var point = new Point(Marshal.ReadInt32(data), Marshal.ReadInt32(data, 4));
                 uint processId;
                 Native.GetWindowThreadProcessId(Native.WindowFromPoint(point), out processId);
                 if (processId != ownProcessId)
                 {
-                    if (message.ToInt32() == 0x201) Interlocked.Exchange(ref revealPending, 1);
+                    if (message.ToInt32() == 0x201) { Interlocked.Exchange(ref revealPending, 1); signal.Signal(); }
                     return new IntPtr(1);
                 }
             }
@@ -266,19 +309,23 @@ namespace BlackScreenGuard
         private void Tick(object sender, EventArgs e)
         {
             if (closing) return;
+            timer.Stop();
             if (pendingExit >= 0) { Finish(pendingExit); return; }
             if (stop.WaitOne(0) || parent.HasExited) { Finish(2); return; }
-            if (Interlocked.Exchange(ref displaysChanged, 0) != 0) { HidePrompt(); BuildScreens(); }
+            if (Interlocked.Exchange(ref displaysChanged, 0) != 0) { HidePrompt(); BuildScreens(); if (wasActive) RequestDisplayOff(); }
             if (active.WaitOne(0) && !wasActive)
             {
                 wasActive = true; policy.Reset();
                 forms[0].Activate(); forms[0].Focus();
+                RequestDisplayOff();
 #if TEST_BUILD
                 testClock = Stopwatch.StartNew();
 #endif
             }
             if (wasActive)
             {
+                // Reset even if a quick leave/return was coalesced into one notification.
+                if (Interlocked.Exchange(ref desktopChanged, 0) != 0) policy.Reset();
                 bool visible = false;
                 try { visible = Native.InputDesktopName() == Native.DesktopName(); }
                 catch (System.ComponentModel.Win32Exception) { /* Windows owns the secure desktop. */ }
@@ -290,6 +337,7 @@ namespace BlackScreenGuard
             }
             if (desktopWasVisible && Interlocked.Exchange(ref revealPending, 0) != 0) Reveal(forms[0]);
             if (PromptVisible && !checking && inactivity.Elapsed.TotalSeconds > 12) HidePrompt();
+            if (PromptVisible && pendingExit < 0) Schedule(Math.Max(50, 12000 - (int)inactivity.ElapsedMilliseconds));
 #if TEST_BUILD
             if (!String.IsNullOrEmpty(testMode) && wasActive)
             {
@@ -307,7 +355,7 @@ namespace BlackScreenGuard
                         }
                     }
                     if (PromptVisible) throw new InvalidOperationException("进入黑屏时密码框应保持隐藏。");
-                    File.WriteAllText(Path.Combine(testDirectory, "guard-ready.txt"), "desktop=" + Native.DesktopName() + "\r\nscreens=" + forms.Count + "\r\nkeyboardHook=" + (hook != IntPtr.Zero) + "\r\nmouseHook=" + (mouseHook != IntPtr.Zero) + "\r\nprompt=" + PromptVisible);
+                    File.WriteAllText(Path.Combine(testDirectory, "guard-ready.txt"), "desktop=" + Native.DesktopName() + "\r\nscreens=" + forms.Count + "\r\nkeyboardHook=" + (hook != IntPtr.Zero) + "\r\nmouseHook=" + (mouseHook != IntPtr.Zero) + "\r\nprompt=" + PromptVisible + "\r\nidleTimer=" + timer.Enabled);
                     InjectCombination(new byte[] { 0x5B, 0x44 });
                     InjectCombination(new byte[] { 0x12, 9 });
                     InjectCombination(new byte[] { 0x12, 0x73 });
@@ -322,6 +370,16 @@ namespace BlackScreenGuard
                         Reveal(forms[0]);
                         password.Text = "DefinitelyWrong";
                         TryUnlock().GetAwaiter();
+                    }
+                }
+                if (testMode == "prompt-timeout" && tested)
+                {
+                    if (!timeoutPromptShown) { timeoutPromptShown = true; Reveal(forms[0]); }
+                    if (inactivity.ElapsedMilliseconds > 12500)
+                    {
+                        if (PromptVisible || timer.Enabled) throw new InvalidOperationException("密码框闲置后未隐藏或计时器仍在运行。");
+                        File.WriteAllText(Path.Combine(testDirectory, "prompt-timeout.txt"), "prompt hidden after inactivity; production timer stopped");
+                        Finish(0); return;
                     }
                 }
                 if (testMode == "foreign-focus" && focusTarget != null && !focusInjected && File.Exists(Path.Combine(testDirectory, "focus-target-ready.txt")))
@@ -367,7 +425,7 @@ namespace BlackScreenGuard
                     password.Text = "TestOnly-42!";
                     TryUnlock().GetAwaiter();
                 }
-                else if ((testMode == "auto" || testMode == "child-crash" || testMode == "restore-retry" || testMode == "foreign-focus") && testClock.ElapsedMilliseconds > 3500)
+                else if ((testMode == "auto" || testMode == "child-crash" || testMode == "restore-retry" || testMode == "foreign-focus" || testMode == "monitor-off") && testClock.ElapsedMilliseconds > 3500)
                 {
                     if (testMode == "child-crash") Environment.Exit(37);
                     else
@@ -376,12 +434,20 @@ namespace BlackScreenGuard
                         Finish(0);
                     }
                 }
-                else if (testClock.ElapsedMilliseconds > 12000) Finish(3);
+                else if (testClock.ElapsedMilliseconds > (testMode == "prompt-timeout" ? 24000 : 12000)) Finish(3);
             }
 #endif
         }
 
 #if TEST_BUILD
+        internal bool CaptureTestPowerCommand(long state)
+        {
+            if (testMode != "monitor-off") return false;
+            if (state != 2) throw new InvalidOperationException("显示器电源命令参数不正确。");
+            Directory.CreateDirectory(testDirectory);
+            File.WriteAllText(Path.Combine(testDirectory, "monitor-off-command.txt"), "SC_MONITORPOWER=2 received by the black window; intercepted before hardware power change");
+            return true;
+        }
         private static void InjectCombination(byte[] keys)
         {
             foreach (byte key in keys) Native.keybd_event(key, 0, 0, UIntPtr.Zero);
@@ -396,6 +462,7 @@ namespace BlackScreenGuard
             pendingExit = exitCode;
             if (!Native.TryRestore(original))
             {
+                Schedule(500);
 #if TEST_BUILD
                 restoreRetries++;
 #endif
@@ -407,9 +474,11 @@ namespace BlackScreenGuard
 #endif
             closing = true; Environment.ExitCode = exitCode;
             if (timer != null) timer.Stop();
+            if (desktopHook != IntPtr.Zero) { Native.UnhookWinEvent(desktopHook); desktopHook = IntPtr.Zero; }
             if (hook != IntPtr.Zero) { Native.UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
             if (mouseHook != IntPtr.Zero) { Native.UnhookWindowsHookEx(mouseHook); mouseHook = IntPtr.Zero; }
             Native.SetThreadExecutionState(Native.Continuous);
+            if (displayOff) Native.SetThreadExecutionState(Native.DisplayRequired);
             if (cursorHidden) { Cursor.Show(); cursorHidden = false; }
             foreach (var form in forms) { form.AllowClose = true; form.Close(); }
             ExitThread();
@@ -420,6 +489,11 @@ namespace BlackScreenGuard
             {
                 disposed = true;
                 SystemEvents.DisplaySettingsChanged -= DisplaysChanged;
+                parent.Exited -= ParentExited;
+                if (activeWait != null) activeWait.Unregister(null);
+                if (stopWait != null) stopWait.Unregister(null);
+                if (desktopHook != IntPtr.Zero) Native.UnhookWinEvent(desktopHook);
+                signal.Dispose();
                 if (timer != null) timer.Dispose();
                 if (hook != IntPtr.Zero) Native.UnhookWindowsHookEx(hook);
                 if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
@@ -427,6 +501,7 @@ namespace BlackScreenGuard
                 if (cursorHidden) { Cursor.Show(); cursorHidden = false; }
                 foreach (var form in forms) form.Dispose();
 #if TEST_BUILD
+                if (testTimer != null) testTimer.Dispose();
                 if (focusTarget != null)
                 {
                     if (!focusTarget.HasExited) focusTarget.Kill();

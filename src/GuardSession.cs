@@ -19,6 +19,8 @@ namespace BlackScreenGuard
         private bool switched, disposed;
 
         internal GuardSession(string credentialsPath, bool awake, string testMode, string testDirectory)
+            : this(credentialsPath, awake, false, testMode, testDirectory) { }
+        internal GuardSession(string credentialsPath, bool awake, bool displayOff, string testMode, string testDirectory)
         {
             OriginalDesktop = Native.DesktopName();
             Token = Guid.NewGuid().ToString("N");
@@ -32,7 +34,7 @@ namespace BlackScreenGuard
                 if (desktopHandle == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
                 string exe = Process.GetCurrentProcess().MainModule.FileName;
                 string[] arguments = { exe, "--guard", OriginalDesktop, Token, Process.GetCurrentProcess().Id.ToString(),
-                    credentialsPath, awake ? "1" : "0", testMode ?? "", testDirectory ?? "" };
+                    credentialsPath, ((awake ? 1 : 0) | (displayOff ? 2 : 0)).ToString(), testMode ?? "", testDirectory ?? "" };
                 var command = new StringBuilder();
                 foreach (string argument in arguments) command.Append(Quote(argument)).Append(' ');
                 var startup = new Native.StartupInfo();
@@ -69,6 +71,7 @@ namespace BlackScreenGuard
         }
 
         internal bool Ready { get { return ready.WaitOne(0); } }
+        internal WaitHandle ReadySignal { get { return ready; } }
         internal bool Exited { get { return Child == null || Child.HasExited; } }
         internal void Activate()
         {

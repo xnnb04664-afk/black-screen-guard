@@ -11,8 +11,21 @@ namespace BlackScreenGuard
         internal const uint Continuous = 0x80000000;
         internal const uint SystemRequired = 1;
         internal const uint DisplayRequired = 2;
+        internal const int WmSysCommand = 0x112, MonitorPower = 0xF170;
+        internal static uint ExecutionFlags(bool awake, bool displayOff)
+        {
+            return Continuous | (awake ? SystemRequired | (displayOff ? 0 : DisplayRequired) : 0);
+        }
         internal const int WmKeyDown = 0x100, WmKeyUp = 0x101, WmSysKeyDown = 0x104, WmSysKeyUp = 0x105;
         internal delegate IntPtr HookProc(int code, IntPtr message, IntPtr data);
+        internal delegate void WinEventProc(IntPtr hook, uint kind, IntPtr window, int objectId, int childId, uint thread, uint time);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool PostMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr SetWinEventHook(uint minimum, uint maximum, IntPtr module, WinEventProc callback, uint process, uint thread, uint flags);
+        [DllImport("user32.dll")]
+        internal static extern bool UnhookWinEvent(IntPtr hook);
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct KeyboardData

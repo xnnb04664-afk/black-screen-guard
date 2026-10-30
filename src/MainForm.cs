@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Threading.Tasks;
@@ -16,18 +15,18 @@ namespace BlackScreenGuard
         private readonly Button start, change;
         private readonly Control newFields;
         private readonly TableLayoutPanel layout;
-        private readonly System.Windows.Forms.Timer timer;
         private Credentials stored;
         private readonly string credentialPath, testDirectory;
-        private GuardSession session;
+        private readonly bool displayOff;
         private bool changing, busy;
-        private int countdown;
-        private readonly Stopwatch phaseClock = new Stopwatch();
+        internal bool KeepAwake { get { return awake.Checked; } }
 
-        internal MainForm() : this(Credentials.FilePath, null) { }
-        internal MainForm(string credentialPath, string testDirectory)
+        internal MainForm() : this(Credentials.FilePath, null, true) { }
+        internal MainForm(string credentialPath, string testDirectory) : this(credentialPath, testDirectory, true) { }
+        internal MainForm(string credentialPath, string testDirectory, bool displayOff)
         {
             this.credentialPath = credentialPath; this.testDirectory = testDirectory;
+            this.displayOff = displayOff;
             SuspendLayout();
             Text = "黑屏守护";
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
@@ -67,11 +66,11 @@ namespace BlackScreenGuard
             newStack.Controls.Add(Field("新密码", out next), 0, 0);
             newStack.Controls.Add(Field("再输一次密码", out confirm), 0, 1);
             newFields = newStack; stack.Controls.Add(newFields, 0, 5);
-            awake = new CheckBox { Text = "黑屏期间防止电脑自动睡眠", Checked = true, Dock = DockStyle.Fill, Margin = Padding.Empty };
+            awake = new CheckBox { Text = displayOff ? "防止电脑自动睡眠（显示器仍可息屏）" : "黑屏期间防止电脑自动睡眠", Checked = true, Dock = DockStyle.Fill, Margin = Padding.Empty };
             stack.Controls.Add(awake, 0, 6);
             var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
             actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); actions.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112));
-            start = MakeButton("开始黑屏", true); start.Dock = DockStyle.Fill; start.Margin = new Padding(0, 3, 10, 3);
+            start = MakeButton(displayOff ? "立即息屏" : "立即黑屏", true); start.Dock = DockStyle.Fill; start.Margin = new Padding(0, 3, 10, 3);
             change = MakeButton("修改密码", false); change.Dock = DockStyle.Fill; change.Margin = new Padding(0, 3, 0, 3);
             start.Click += async delegate { await BeginLock(); };
             change.Click += delegate { changing = !changing; UpdateMode(); };
@@ -81,8 +80,6 @@ namespace BlackScreenGuard
             stack.Controls.Add(new Label { Text = "按任意键或单击后输入密码解开。\r\n系统安全界面、关机及强制重启仍可使用。",
                 Dock = DockStyle.Fill, ForeColor = Color.FromArgb(98, 111, 132), Font = new Font("Microsoft YaHei UI", 8.5f) }, 0, 9);
             AcceptButton = start;
-            timer = new System.Windows.Forms.Timer { Interval = 200 };
-            timer.Tick += Poll;
             try { stored = Credentials.Load(credentialPath); }
             catch (Exception)
             {
@@ -113,8 +110,9 @@ namespace BlackScreenGuard
         private void UpdateMode()
         {
             bool exists = stored != null;
-            heading.Text = exists ? (changing ? "验证原密码，再设置新密码" : "输入密码后开始黑屏") : "第一次使用，先设置密码";
+            heading.Text = exists ? (changing ? "验证原密码，再设置新密码" : (displayOff ? "密码已保存，下次双击图标立即息屏" : "密码已保存，点击按钮立即黑屏")) : "第一次使用，先设置密码";
             currentLabel.Text = exists ? "当前密码" : "解锁密码（6–128 位英文、数字或符号）";
+            current.Parent.Visible = !exists || changing;
             next.Parent.Visible = exists && changing;
             confirm.Parent.Visible = !exists || changing;
             newFields.Visible = !exists || changing;
@@ -123,17 +121,14 @@ namespace BlackScreenGuard
             int fieldsHeight = changing && exists ? 157 : (exists ? 0 : 79);
             float scale = AutoScaleDimensions.Width / 96f;
             layout.RowStyles[5].Height = fieldsHeight * scale;
+            layout.RowStyles[4].Height = (!exists || changing ? 79 : 0) * scale;
             ((TableLayoutPanel)newFields).RowStyles[0].Height = (exists && changing ? 78 : 0) * scale;
-            ClientSize = new Size((int)(548 * scale), (int)((565 + fieldsHeight) * scale));
+            ClientSize = new Size((int)(548 * scale), (int)((565 + fieldsHeight - (exists && !changing ? 79 : 0)) * scale));
             change.Visible = exists; change.Text = changing ? "取消修改" : "修改密码";
             current.Clear(); next.Clear(); confirm.Clear();
         }
         private async Task BeginLock()
         {
-            if (countdown > 0)
-            {
-                countdown = 0; timer.Stop(); busy = false; SetInputs(true); status.Text = "已取消。"; start.Text = "开始黑屏"; return;
-            }
             if (busy) return;
             status.Text = "";
             string old = current.Text, fresh = next.Text, repeated = confirm.Text;
@@ -146,7 +141,8 @@ namespace BlackScreenGuard
             try
             {
                 Credentials replacement = null;
-                bool valid = await Task.Run(delegate
+                bool valid = true;
+                if (stored == null || changing) valid = await Task.Run(delegate
                 {
                     if (stored != null && !stored.Verify(old)) return false;
                     if (stored == null || changing) replacement = Credentials.Create(stored == null ? old : fresh);
@@ -155,12 +151,10 @@ namespace BlackScreenGuard
                 if (IsDisposed || Disposing) return;
                 if (!valid) { status.Text = "当前密码不对。"; busy = false; SetInputs(true); return; }
                 if (replacement != null) { replacement.Save(credentialPath); stored = replacement; }
-                changing = false; UpdateMode(); SetInputs(false);
+                changing = false; SetInputs(false);
                 current.Clear(); next.Clear(); confirm.Clear();
-                countdown = 3; phaseClock.Restart();
-                start.Enabled = true; start.Text = "取消（3）";
-                status.Text = "3 秒后进入黑屏；可先切回需要运行的软件。";
-                timer.Start();
+                DialogResult = DialogResult.OK;
+                Close();
             }
             catch (Exception ex) { status.Text = "无法开始：" + ex.Message; busy = false; SetInputs(true); }
             finally { old = null; fresh = null; repeated = null; }
@@ -168,53 +162,6 @@ namespace BlackScreenGuard
         private void SetInputs(bool enabled)
         {
             current.Enabled = enabled; next.Enabled = enabled; confirm.Enabled = enabled; awake.Enabled = enabled; change.Enabled = enabled; start.Enabled = enabled;
-        }
-        private void Poll(object sender, EventArgs e)
-        {
-            try
-            {
-                if (countdown > 0)
-                {
-                    countdown = Math.Max(0, 3 - (int)phaseClock.Elapsed.TotalSeconds);
-                    start.Text = "取消（" + countdown + "）";
-                    if (countdown == 0)
-                    {
-                        start.Enabled = false; start.Text = "准备黑屏…";
-                        session = new GuardSession(credentialPath, awake.Checked, testDirectory == null ? null : "unlock", testDirectory); phaseClock.Restart();
-                    }
-                    return;
-                }
-                if (session != null && session.Exited)
-                {
-                    if (!session.TryRestore()) return;
-                    int code = session.Child.ExitCode;
-                    session.Dispose(); session = null;
-                    timer.Stop(); busy = false; Show(); Activate(); UpdateMode(); SetInputs(true); start.Text = "开始黑屏";
-                    status.Text = code == 0 ? "已解开黑屏，桌面已恢复。" : "黑屏工具已退出，桌面已恢复。";
-                }
-                else if (session != null && session.Ready && Visible)
-                {
-                    session.Activate(); Hide();
-                }
-                else if (session != null && Visible && phaseClock.Elapsed.TotalSeconds > 12)
-                    throw new TimeoutException("黑屏窗口启动超时，已取消。");
-            }
-            catch (Exception ex)
-            {
-                if (session != null && !session.TryRestore()) return;
-                if (session != null) { session.Dispose(); session = null; }
-                timer.Stop(); countdown = 0; busy = false; Show(); SetInputs(true); start.Text = "开始黑屏"; status.Text = "未进入黑屏：" + ex.Message;
-            }
-        }
-        protected override void OnFormClosing(FormClosingEventArgs e)
-        {
-            if (session != null && !session.TryRestore()) { e.Cancel = true; return; }
-            base.OnFormClosing(e);
-        }
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing) { timer.Dispose(); if (session != null) session.Dispose(); }
-            base.Dispose(disposing);
         }
 #if TEST_BUILD
         internal void SavePreview(string path)
@@ -230,7 +177,13 @@ namespace BlackScreenGuard
             current.Text = "TestOnly-42!"; confirm.Text = "TestOnly-42!";
             return BeginLock();
         }
-        internal bool TestComplete { get { return !busy && session == null && status.Text == "已解开黑屏，桌面已恢复。"; } }
+        internal Task ChangeTestPassword(string old, string fresh)
+        {
+            changing = true; UpdateMode(); current.Text = old; next.Text = fresh; confirm.Text = fresh;
+            return BeginLock();
+        }
+        internal Task StartSavedTestFlow() { return BeginLock(); }
+        internal string TestStatus { get { return status.Text; } }
 #endif
     }
 

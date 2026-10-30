@@ -7,9 +7,9 @@ using System.Reflection;
 
 [assembly: AssemblyTitle("黑屏守护")]
 [assembly: AssemblyDescription("独立黑屏桌面与密码解锁")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
-[assembly: AssemblyInformationalVersion("1.0.1")]
+[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyFileVersion("1.0.2.0")]
+[assembly: AssemblyInformationalVersion("1.0.2")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8")]
 
 namespace BlackScreenGuard
@@ -25,6 +25,8 @@ namespace BlackScreenGuard
             if (args.Length == 2 && args[0] == "--test-focus-target") return SelfTests.FocusTarget(args[1]);
             if (args.Length == 3 && args[0] == "--verify-release") return SelfTests.VerifyRelease(args[1], args[2]);
             if (args.Length == 2 && args[0] == "--self-test") return SelfTests.Run(args[1]);
+            if (args.Length == 3 && args[0] == "--measure") return SelfTests.Measure(args[1], args[2]);
+            if (args.Length == 3 && args[0] == "--check-display-power") return SelfTests.Measure(args[1], args[2], true);
             if (args.Length == 3 && args[0] == "--test-parent-crash") return SelfTests.CrashLauncher(args[1], args[2]);
             if (args.Length == 2 && args[0] == "--preview")
             {
@@ -32,7 +34,14 @@ namespace BlackScreenGuard
                 return 0;
             }
 #endif
-            if (args.Length != 0) return 1;
+            bool settings = false, displayOff = true;
+            foreach (string argument in args)
+            {
+                if (argument == "--settings") settings = true;
+                else if (argument == "--black-only") displayOff = false;
+                else return 1;
+            }
+            settings |= (Control.ModifierKeys & Keys.Shift) != 0;
             bool created;
             using (var mutex = new Mutex(true, "Local\\BlackScreenGuard_Launcher", out created))
             {
@@ -40,8 +49,20 @@ namespace BlackScreenGuard
                 try
                 {
                     Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
-                    using (var form = new MainForm()) Application.Run(form);
-                    return 0;
+                    bool awake = true;
+                    if (settings || Credentials.Load(Credentials.FilePath) == null)
+                    {
+                        using (var form = new MainForm(Credentials.FilePath, null, displayOff))
+                        {
+                            if (form.ShowDialog() != DialogResult.OK) return 0;
+                            awake = form.KeepAwake;
+                        }
+                    }
+                    using (var context = new QuickLockContext(Credentials.FilePath, awake, displayOff, null, null))
+                    {
+                        Application.Run(context);
+                        return context.Result;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -53,6 +74,8 @@ namespace BlackScreenGuard
         private static int RunGuard(string[] args)
         {
             if (args.Length != 8) return 1;
+            int power;
+            if (!Int32.TryParse(args[5], out power) || power < 0 || power > 3) return 1;
 #if !TEST_BUILD
             if (args[6].Length != 0 || args[7].Length != 0) return 1;
 #endif
@@ -64,7 +87,7 @@ namespace BlackScreenGuard
                 Control.CheckForIllegalCrossThreadCalls = true;
 #endif
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
-                using (var context = new GuardContext(original, args[2], Int32.Parse(args[3]), args[4], args[5] == "1", args[6], args[7]))
+                using (var context = new GuardContext(original, args[2], Int32.Parse(args[3]), args[4], (power & 1) != 0, (power & 2) != 0, args[6], args[7]))
                     Application.Run(context);
                 return Environment.ExitCode;
             }

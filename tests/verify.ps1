@@ -24,7 +24,7 @@ if ($desktopHandle -eq [IntPtr]::Zero) { throw '无法准备测试恢复。' }
 $testProcess = $null
 try {
     $testProcess = Start-Process -FilePath $exe -ArgumentList @('--self-test', ('"' + $report + '"')) -PassThru -WindowStyle Hidden
-    if (-not $testProcess.WaitForExit(60000)) { throw '测试超时，正在恢复桌面。' }
+    if (-not $testProcess.WaitForExit(90000)) { throw '测试超时，正在恢复桌面。' }
     Get-Content -LiteralPath (Join-Path $report 'tests.txt')
     if ($testProcess.ExitCode -ne 0) { throw "测试失败：$($testProcess.ExitCode)" }
     Write-Output "验证结果：$report"
