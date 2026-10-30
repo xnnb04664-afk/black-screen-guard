@@ -98,6 +98,8 @@ namespace BlackScreenGuard
         private readonly Button unlock;
         private readonly Stopwatch inactivity = Stopwatch.StartNew(), retryClock = new Stopwatch();
         private bool cursorHidden, checking, closing, wasActive, desktopWasVisible, disposed;
+        private bool displaySleepPending, wakePromptPending;
+        private int displayState = -1;
         private int attempts, retryDelay, displaysChanged, revealPending, desktopChanged, pendingExit = -1;
 #if TEST_BUILD
         private bool tested;
@@ -107,6 +109,9 @@ namespace BlackScreenGuard
         private Process focusTarget;
         private bool focusInjected, focusChecked;
         private bool timeoutPromptShown;
+        private int wakeTestStage;
+        private bool physicalWakeRequested;
+        private readonly List<int> testDisplayStates = new List<int>();
         private readonly System.Windows.Forms.Timer testTimer;
 #endif
         internal bool PromptVisible { get { return prompt.Visible; } }
@@ -127,7 +132,7 @@ namespace BlackScreenGuard
             stop = EventWaitHandle.OpenExisting("Local\\BSG_" + token + "_stop");
             callback = Keyboard;
             mouseCallback = Mouse;
-            signal = new EventSignal(delegate { Tick(null, EventArgs.Empty); });
+            signal = new EventSignal(delegate { Tick(null, EventArgs.Empty); }, displayOff ? (Action<int>)DisplayStateChanged : null);
             timer = new System.Windows.Forms.Timer();
             timer.Tick += Tick;
             desktopCallback = delegate { Interlocked.Exchange(ref desktopChanged, 1); signal.Signal(); };
@@ -204,6 +209,17 @@ namespace BlackScreenGuard
         }
 
         private void ParentExited(object sender, EventArgs e) { signal.Signal(); }
+        private void DisplayStateChanged(int state)
+        {
+            // Ignore the initial "on" notification. Only a real off-to-on transition reveals the UI.
+            if (state == 0) { displaySleepPending = true; wakePromptPending = false; }
+            else if (displayState == 0) wakePromptPending = true;
+            displayState = state;
+#if TEST_BUILD
+            testDisplayStates.Add(state);
+#endif
+            if (signal != null) signal.Signal();
+        }
         private void Schedule(int milliseconds)
         {
             timer.Stop(); timer.Interval = Math.Max(1, milliseconds); timer.Start();
@@ -228,9 +244,13 @@ namespace BlackScreenGuard
         internal void HidePrompt()
         {
             if (checking) return;
+            ClearPrompt();
+            if (wasActive) RequestDisplayOff();
+        }
+        private void ClearPrompt()
+        {
             password.Clear(); error.Text = ""; prompt.Visible = false; HideCursor();
             if (pendingExit < 0) timer.Stop();
-            if (wasActive) RequestDisplayOff();
         }
         private void RequestDisplayOff()
         {
@@ -312,6 +332,11 @@ namespace BlackScreenGuard
             timer.Stop();
             if (pendingExit >= 0) { Finish(pendingExit); return; }
             if (stop.WaitOne(0) || parent.HasExited) { Finish(2); return; }
+            if (displaySleepPending)
+            {
+                displaySleepPending = false;
+                if (!checking) ClearPrompt();
+            }
             if (Interlocked.Exchange(ref displaysChanged, 0) != 0) { HidePrompt(); BuildScreens(); if (wasActive) RequestDisplayOff(); }
             if (active.WaitOne(0) && !wasActive)
             {
@@ -335,7 +360,11 @@ namespace BlackScreenGuard
                     policy.Reset(); desktopWasVisible = visible;
                 }
             }
-            if (desktopWasVisible && Interlocked.Exchange(ref revealPending, 0) != 0) Reveal(forms[0]);
+            if (desktopWasVisible && (Interlocked.Exchange(ref revealPending, 0) != 0 || wakePromptPending))
+            {
+                wakePromptPending = false;
+                Reveal(forms[0]);
+            }
             if (PromptVisible && !checking && inactivity.Elapsed.TotalSeconds > 12) HidePrompt();
             if (PromptVisible && pendingExit < 0) Schedule(Math.Max(50, 12000 - (int)inactivity.ElapsedMilliseconds));
 #if TEST_BUILD
@@ -354,14 +383,17 @@ namespace BlackScreenGuard
                             bitmap.Save(Path.Combine(testDirectory, "black-" + forms.IndexOf(form) + ".png"));
                         }
                     }
-                    if (PromptVisible) throw new InvalidOperationException("进入黑屏时密码框应保持隐藏。");
+                    if (PromptVisible && testMode != "display-wake-physical") throw new InvalidOperationException("进入黑屏时密码框应保持隐藏。");
                     File.WriteAllText(Path.Combine(testDirectory, "guard-ready.txt"), "desktop=" + Native.DesktopName() + "\r\nscreens=" + forms.Count + "\r\nkeyboardHook=" + (hook != IntPtr.Zero) + "\r\nmouseHook=" + (mouseHook != IntPtr.Zero) + "\r\nprompt=" + PromptVisible + "\r\nidleTimer=" + timer.Enabled);
-                    InjectCombination(new byte[] { 0x5B, 0x44 });
-                    InjectCombination(new byte[] { 0x12, 9 });
-                    InjectCombination(new byte[] { 0x12, 0x73 });
-                    InjectCombination(new byte[] { 0x11, 0x10, 27 });
-                    InjectCombination(new byte[] { 0x2C });
-                    InjectCombination(new byte[] { 0xB3 });
+                    if (testMode != "display-wake-physical")
+                    {
+                        InjectCombination(new byte[] { 0x5B, 0x44 });
+                        InjectCombination(new byte[] { 0x12, 9 });
+                        InjectCombination(new byte[] { 0x12, 0x73 });
+                        InjectCombination(new byte[] { 0x11, 0x10, 27 });
+                        InjectCombination(new byte[] { 0x2C });
+                        InjectCombination(new byte[] { 0xB3 });
+                    }
                     if (testMode == "foreign-focus")
                         focusTarget = Process.Start(new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName,
                             "--test-focus-target \"" + testDirectory + "\"") { UseShellExecute = false });
@@ -403,11 +435,35 @@ namespace BlackScreenGuard
                     File.WriteAllText(Path.Combine(testDirectory, "focus-input-blocked.txt"), "foreign input blocked; guard regained focus");
                     focusTarget.CloseMainWindow();
                 }
-                if (tested && !keyboardChecked && testClock.ElapsedMilliseconds > 1200)
+                if (tested && !keyboardChecked && testMode != "display-wake-physical" && testClock.ElapsedMilliseconds > 1200)
                 {
                     keyboardChecked = true;
                     if (blockedKeys < 16) throw new InvalidOperationException("快捷键实际拦截验证未通过。");
                     File.WriteAllText(Path.Combine(testDirectory, "keyboard-blocked.txt"), "blocked injected keyboard events=" + blockedKeys);
+                }
+                if (tested && testClock.ElapsedMilliseconds > 1500)
+                {
+                    if (testMode == "display-wake") RunWakeTests();
+                    if (testMode == "display-wake-physical")
+                    {
+                        if (!physicalWakeRequested && testDisplayStates.Contains(0))
+                        {
+                            physicalWakeRequested = true;
+                            Native.SetThreadExecutionState(Native.DisplayRequired);
+                        }
+                        if (physicalWakeRequested && displayState == 1 && PromptVisible && password.Focused && !checking)
+                        {
+                            using (var bitmap = new Bitmap(forms[0].Width, forms[0].Height))
+                            {
+                                forms[0].DrawToBitmap(bitmap, forms[0].ClientRectangle);
+                                bitmap.Save(Path.Combine(testDirectory, "wake-password-prompt.png"));
+                            }
+                            File.WriteAllText(Path.Combine(testDirectory, "physical-display-wake.txt"),
+                                "states=" + String.Join(",", testDisplayStates) + "\r\nautomaticPrompt=True\r\npasswordFocused=True");
+                            password.Text = "TestOnly-42!";
+                            TryUnlock().GetAwaiter();
+                        }
+                    }
                 }
                 if (testMode == "unlock" && !promptCaptured && attempts == 1)
                 {
@@ -442,11 +498,61 @@ namespace BlackScreenGuard
 #if TEST_BUILD
         internal bool CaptureTestPowerCommand(long state)
         {
-            if (testMode != "monitor-off") return false;
+            if (testMode != "monitor-off" && testMode != "display-wake") return false;
             if (state != 2) throw new InvalidOperationException("显示器电源命令参数不正确。");
             Directory.CreateDirectory(testDirectory);
             File.WriteAllText(Path.Combine(testDirectory, "monitor-off-command.txt"), "SC_MONITORPOWER=2 received by the black window; intercepted before hardware power change");
             return true;
+        }
+        private void RunWakeTests()
+        {
+            if (wakeTestStage == 0)
+            {
+                SelfTests.SendDisplayState(signal.Handle, 1);
+                if (PromptVisible) throw new InvalidOperationException("初始亮屏通知不应提前显示密码框。");
+                SelfTests.SendDisplayState(signal.Handle, 0);
+                SelfTests.SendDisplayState(signal.Handle, 1);
+                wakeTestStage = 1;
+            }
+            else if (wakeTestStage == 1)
+            {
+                if (!PromptVisible || !password.Focused) throw new InvalidOperationException("亮屏后密码框未自动显示并获得焦点。");
+                password.Text = "Partial-42";
+                SelfTests.SendDisplayState(signal.Handle, 1);
+                wakeTestStage = 2;
+            }
+            else if (wakeTestStage == 2)
+            {
+                if (password.Text != "Partial-42") throw new InvalidOperationException("重复亮屏通知清除了正在输入的密码。");
+                HidePrompt();
+                SelfTests.SendDisplayState(signal.Handle, 0);
+                wakeTestStage = 3;
+            }
+            else if (wakeTestStage == 3)
+            {
+                if (PromptVisible || timer.Enabled || password.Text.Length != 0)
+                    throw new InvalidOperationException("息屏后密码框未清空，或仍在运行空闲计时器。");
+                // Keep a wake pending while another desktop is visible, then reveal on return.
+                if (!Native.TryRestore(original)) throw new InvalidOperationException("测试桌面切换失败。");
+                SelfTests.SendDisplayState(signal.Handle, 1);
+                wakeTestStage = 4;
+            }
+            else if (wakeTestStage == 4)
+            {
+                if (PromptVisible || !wakePromptPending) throw new InvalidOperationException("其他桌面可见时未保留亮屏通知。");
+                Native.Restore(Native.DesktopName());
+                wakeTestStage = 5;
+            }
+            else if (wakeTestStage == 5)
+            {
+                if (!PromptVisible || !password.Focused || password.Text.Length != 0)
+                    throw new InvalidOperationException("再次亮屏或返回隔离桌面后密码框未恢复。");
+                File.WriteAllText(Path.Combine(testDirectory, "display-wake.txt"),
+                    "automatic prompt and focus; duplicate-on preserves typing; off clears input and stops timer; wake survives desktop switch");
+                wakeTestStage = 6;
+                password.Text = "TestOnly-42!";
+                TryUnlock().GetAwaiter();
+            }
         }
         private static void InjectCombination(byte[] keys)
         {

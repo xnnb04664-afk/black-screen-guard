@@ -12,6 +12,8 @@ namespace BlackScreenGuard
         internal const uint SystemRequired = 1;
         internal const uint DisplayRequired = 2;
         internal const int WmSysCommand = 0x112, MonitorPower = 0xF170;
+        internal const int WmPowerBroadcast = 0x218, PowerSettingChange = 0x8013;
+        internal static readonly Guid SessionDisplayStatus = new Guid("2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5");
         internal static uint ExecutionFlags(bool awake, bool displayOff)
         {
             return Continuous | (awake ? SystemRequired | (displayOff ? 0 : DisplayRequired) : 0);
@@ -22,6 +24,10 @@ namespace BlackScreenGuard
 
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool PostMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr RegisterPowerSettingNotification(IntPtr recipient, ref Guid setting, uint flags);
+        [DllImport("user32.dll")]
+        internal static extern bool UnregisterPowerSettingNotification(IntPtr registration);
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern IntPtr SetWinEventHook(uint minimum, uint maximum, IntPtr module, WinEventProc callback, uint process, uint thread, uint flags);
         [DllImport("user32.dll")]

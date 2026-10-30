@@ -7,9 +7,9 @@ using System.Reflection;
 
 [assembly: AssemblyTitle("黑屏守护")]
 [assembly: AssemblyDescription("独立黑屏桌面与密码解锁")]
-[assembly: AssemblyVersion("1.0.2.0")]
-[assembly: AssemblyFileVersion("1.0.2.0")]
-[assembly: AssemblyInformationalVersion("1.0.2")]
+[assembly: AssemblyVersion("1.0.3.0")]
+[assembly: AssemblyFileVersion("1.0.3.0")]
+[assembly: AssemblyInformationalVersion("1.0.3")]
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8")]
 
 namespace BlackScreenGuard

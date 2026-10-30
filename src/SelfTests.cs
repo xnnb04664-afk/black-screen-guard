@@ -25,12 +25,13 @@ namespace BlackScreenGuard
             try
             {
                 Assembly release = Assembly.LoadFile(executable);
-                Check(release.GetName().Version.ToString() == "1.0.2.0", "release version is 1.0.2.0");
+                Check(release.GetName().Version.ToString() == "1.0.3.0", "release version is 1.0.3.0");
                 Check(release.GetType("BlackScreenGuard.SelfTests") == null, "release excludes self-test implementation");
                 var native = release.GetType("BlackScreenGuard.Native", true);
                 Check(native.GetField("RestoreFailuresRemaining", BindingFlags.Static | BindingFlags.NonPublic) == null, "release excludes fault injection");
                 var guard = release.GetType("BlackScreenGuard.GuardContext", true);
                 Check(guard.GetMethod("InjectCombination", BindingFlags.Static | BindingFlags.NonPublic) == null, "release excludes test key injection");
+                Check(guard.GetMethod("RunWakeTests", BindingFlags.Instance | BindingFlags.NonPublic) == null, "release excludes display-wake test injection");
                 Check(guard.GetField("testMode", BindingFlags.Instance | BindingFlags.NonPublic) == null, "release excludes automatic test unlock state");
                 foreach (string argument in new string[] { "--self-test unused", "--measure unused unused", "--check-display-power unused unused", "--test-parent-crash unused unused", "--test-focus-target unused", "--preview unused", "--guard Default unused 0 unused 0 auto unused" })
                     using (var process = Process.Start(new ProcessStartInfo(executable, argument) { UseShellExecute = false, CreateNoWindow = true }))
@@ -131,6 +132,10 @@ namespace BlackScreenGuard
                     RunQuickLock(directory, uiCredentials, original, "child-crash");
                     RunQuickLock(directory, uiCredentials, original, "monitor-off");
                     Check(File.Exists(Path.Combine(directory, "quick-monitor-off", "monitor-off-command.txt")), "monitor power-off command reaches real guard window");
+                    RunQuickLock(directory, uiCredentials, original, "display-wake");
+                    Check(File.Exists(Path.Combine(directory, "quick-display-wake", "display-wake.txt")), "wake automatically reveals and focuses password, preserves input on duplicate events, and survives desktop switch");
+                    RunQuickLock(directory, uiCredentials, original, "display-wake-physical");
+                    Check(File.Exists(Path.Combine(directory, "quick-display-wake-physical", "physical-display-wake.txt")), "actual Windows display off/on notifications reveal focused password UI before password unlock");
                 }
                 finally { if (File.Exists(uiCredentials)) File.Delete(uiCredentials); }
                 RunSession(directory, temporary, original, "auto", 0);
@@ -194,6 +199,20 @@ namespace BlackScreenGuard
             }
         }
         private static void Pump() { Application.DoEvents(); Thread.Sleep(15); }
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+        internal static void SendDisplayState(IntPtr window, int state)
+        {
+            IntPtr setting = Marshal.AllocHGlobal(24);
+            try
+            {
+                Marshal.StructureToPtr(Native.SessionDisplayStatus, setting, false);
+                Marshal.WriteInt32(setting, 16, 4);
+                Marshal.WriteInt32(setting, 20, state);
+                SendMessage(window, Native.WmPowerBroadcast, new IntPtr(Native.PowerSettingChange), setting);
+            }
+            finally { Marshal.FreeHGlobal(setting); }
+        }
         private sealed class DisplayObserver : NativeWindow, IDisposable
         {
             private readonly IntPtr registration;
@@ -289,7 +308,7 @@ namespace BlackScreenGuard
         private static void RunQuickLock(string directory, string credentials, string original, string mode)
         {
             var clock = Stopwatch.StartNew();
-            using (var context = new QuickLockContext(credentials, true, mode == "monitor-off", mode, Path.Combine(directory, "quick-" + mode)))
+            using (var context = new QuickLockContext(credentials, true, mode == "monitor-off" || mode.StartsWith("display-wake"), mode, Path.Combine(directory, "quick-" + mode)))
             {
                 while (!context.Activated && !context.Completed && clock.ElapsedMilliseconds < 8000) Pump();
                 long activation = clock.ElapsedMilliseconds;
